@@ -20,6 +20,7 @@ from collections import defaultdict
 from typing import Any, Dict
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
@@ -246,6 +247,30 @@ class TextTrainer:
 
         return loss, loss_dict
 
+    def _prepare_step_iterator(self, data_iterator: Any) -> Any:
+        """Read a complete optimizer step and agree on EOF before any model collective.
+
+        Only source owners advance their loaders. All ranks, including TP peers,
+        participate in the vote because FSDP and EP may span different DP lanes.
+        A partial final accumulation window is discarded on every rank.
+        """
+        batches = []
+        available = True
+        if self.base.get_batch.parallel_context.build_on_rank():
+            try:
+                for _ in range(self.base.num_micro_batches):
+                    batches.append(next(data_iterator))
+            except StopIteration:
+                available = False
+
+        if dist.is_available() and dist.is_initialized():
+            availability = torch.tensor(int(available), dtype=torch.int32, device=self.base.device)
+            dist.all_reduce(availability, op=dist.ReduceOp.MIN)
+            available = bool(availability.item())
+        if not available:
+            raise StopIteration
+        return iter(batches)
+
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step.
 
@@ -255,6 +280,7 @@ class TextTrainer:
         Returns:
             Aggregated loss and gradient norm for the completed step.
         """
+        data_iterator = self._prepare_step_iterator(data_iterator)
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
 
@@ -308,7 +334,7 @@ class TextTrainer:
             config = self.base.config
             self.on_train_begin()
             logger.info(
-                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Estimated train epochs: %s.",
                 self.base.local_rank,
                 self.base.state.global_step,
                 self.base.train_iters,
@@ -316,8 +342,22 @@ class TextTrainer:
                 self.base.train_epochs,
             )
 
-            # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-            for epoch in range(self.base.state.epoch, self.base.train_epochs):
+            # Dynamic loaders have no batch count until their sources are exhausted.
+            # Their estimated train_epochs must not limit an explicit update budget.
+            try:
+                len(self.base.train_dataloader)
+                dynamic_epochs = False
+            except TypeError:
+                dynamic_epochs = True
+            if dist.is_available() and dist.is_initialized():
+                # TP peers can have no loader even when the source owner has a sized one.
+                dynamic_flag = torch.tensor(int(dynamic_epochs), dtype=torch.int32, device=self.base.device)
+                dist.all_reduce(dynamic_flag, op=dist.ReduceOp.MAX)
+                dynamic_epochs = bool(dynamic_flag.item())
+            epoch = self.base.state.epoch
+            while self.base.state.global_step < self.base.train_iters:
+                if not dynamic_epochs and epoch >= self.base.train_epochs:
+                    break
                 train_dataloader = self.base.train_dataloader
                 if hasattr(train_dataloader, "set_epoch"):
                     train_dataloader.set_epoch(epoch)
@@ -325,22 +365,29 @@ class TextTrainer:
                 self.base.state.epoch = epoch
                 self.on_epoch_begin()
                 data_iterator = iter(train_dataloader) if train_dataloader is not None else None
-                start_step = self.base.state.global_step - epoch * self.base.train_steps
-                train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+                epoch_start_step = self.base.state.global_step
+                start_step = 0 if dynamic_epochs else self.base.state.global_step - epoch * self.base.train_steps
+                train_steps = (
+                    self.base.train_iters - self.base.state.global_step
+                    if dynamic_epochs
+                    else min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+                )
                 for _ in range(start_step, train_steps):
                     try:
                         self.train_step(data_iterator)
                     except StopIteration:
                         logger.info(
-                            "epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last
+                            "epoch:%s Dataloader finished across ranks with drop_last %s",
+                            epoch, config.dataloader.drop_last,
                         )
                         break
 
                 self.on_epoch_end()
                 self.base.state.epoch = epoch + 1
                 print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-                if self.base.state.global_step >= self.base.train_iters:
-                    break
+                if self.base.state.global_step == epoch_start_step:
+                    raise ValueError("train DataLoader must provide one complete optimizer step on every rank per epoch")
+                epoch += 1
 
             memory_profiler.stop()
             self.on_train_end()
